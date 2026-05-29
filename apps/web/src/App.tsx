@@ -1274,6 +1274,7 @@ function AppInner() {
       setAgentsLoading(true);
       try {
         const next = await fetchAgentsStream({
+          refresh: true,
           onAgent: (agent) => {
             if (!isCurrentAgentStreamRequest(agentRequestId)) return;
             setAgents((current) =>

@@ -138,6 +138,7 @@ import {
   checkWindowsCmdShimCommandLineBudget,
   checkWindowsDirectExeCommandLineBudget,
   detectAgents,
+  detectAgentsCached,
   getAgentDef,
   isKnownModel,
   openDesignAmrTraceEnv,
@@ -3731,9 +3732,9 @@ export async function startServer({
   void readAppConfig(RUNTIME_DATA_DIR)
     .then((config) => {
       orbitService.configure(config.orbit);
-      return detectAgents(config.agentCliEnv ?? {});
+      return detectAgentsCached(config.agentCliEnv ?? {});
     })
-    .catch(() => detectAgents().catch(() => {}));
+    .catch(() => detectAgentsCached().catch(() => {}));
 
   await recoverStaleLiveArtifactRefreshes({ projectsRoot: PROJECTS_DIR }).catch((error) => {
     console.warn('[od] Failed to recover stale live artifact refreshes:', error);

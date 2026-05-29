@@ -216,6 +216,69 @@ pnpm typecheck                 # workspace typecheck
 
 During local development, `tools-dev` starts the daemon first, passes its port into `apps/web`, and `apps/web/next.config.ts` rewrites `/api/*`, `/artifacts/*`, and `/frames/*` to that daemon port so the App Router app can talk to the sibling Express process without CORS setup.
 
+## Dev runtime configuration
+
+The default dev topology is two local processes:
+
+| Process | Default URL | Purpose |
+|---|---|---|
+| Web (Next.js) | `http://localhost:7456` | Browser UI, client state, and same-origin `/api/*` proxy paths |
+| Daemon (Express) | `http://127.0.0.1:7457` | Local REST/SSE APIs, SQLite, project files, and agent CLI spawning |
+
+Keep the browser on the **web** URL (`http://localhost:7456`). Direct daemon URLs are intended for health checks and scripts; the web app relies on same-origin paths so browser storage and API calls line up.
+
+Runtime data is local and gitignored:
+
+| Location | Contents |
+|---|---|
+| `.od/app.sqlite` | projects, conversations, messages, tabs, and saved templates |
+| `.od/app-config.json` | daemon-backed app preferences such as selected agent, selected skill/design system, Orbit settings, telemetry decision, installation id, and custom instructions |
+| `.od/media-config.json` | media provider base URLs and saved media-provider key metadata |
+| `.od/connectors/` | connector-specific configuration such as Composio |
+
+Most appearance/provider form state is also mirrored in browser `localStorage` under `open-design:config`. If a setting appears to reset, check both sides before deleting data:
+
+```bash
+curl -s http://127.0.0.1:7457/api/app-config | jq .
+cat .od/app-config.json
+cat .od/media-config.json 2>/dev/null || true
+```
+
+For a long-running local dev service on Linux/WSL, run the `tools-dev` binary through the repo's pinned toolchain and pass explicit ports:
+
+```ini
+[Service]
+WorkingDirectory=/path/to/open-design
+Environment=MISE_NO_ANALYTICS=1
+ExecStart=/home/linuxbrew/.linuxbrew/bin/mise exec --cd=/path/to/open-design pnpm -- pnpm exec tools-dev run web --web-port 7456 --daemon-port 7457
+```
+
+Then verify the service and ports:
+
+```bash
+systemctl --user daemon-reload
+systemd-analyze --user verify ~/.config/systemd/user/open-design.service
+systemctl --user restart open-design.service
+ss -ltnp '( sport = :7456 or sport = :7457 )'
+curl -s http://127.0.0.1:7457/api/health
+```
+
+If Settings opens slowly or the agent picker looks empty for several seconds, time the local-agent detector:
+
+```bash
+curl -sS -w '\nHTTP %{http_code} time %{time_total}s\n' http://127.0.0.1:7456/api/agents -o /tmp/od-agents.json
+jq '.agents[] | {id, available, version, modelsSource}' /tmp/od-agents.json
+```
+
+Slow `/api/agents` responses usually mean one installed CLI is slow to report capabilities or is installed without an optional runtime dependency. For Hermes, verify the ACP adapter from the same environment that launches Open Design:
+
+```bash
+hermes --version
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"terminal":false},"clientInfo":{"name":"probe","version":"quickstart"}}}\n' | hermes acp --accept-hooks
+```
+
+If Hermes prints `ACP dependencies not installed`, install the Hermes ACP extra in the Hermes Agent environment (for example, from a Hermes Agent source checkout: `pip install -e '.[acp]'`) or choose another available CLI / BYOK provider in Settings.
+
 ## Media generation / agent dispatcher checks
 
 Image, video, audio, and HyperFrames skills call the local `od` CLI through environment variables injected by the daemon when it spawns an agent:

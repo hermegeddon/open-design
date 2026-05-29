@@ -26,6 +26,29 @@ import type {
   RuntimeModelOption,
 } from './types.js';
 
+const DEFAULT_AGENT_DETECTION_CACHE_TTL_MS = 5 * 60_000;
+
+type AgentDetector = (
+  configuredEnvByAgent?: Record<string, Record<string, string>>,
+) => Promise<DetectedAgent[]>;
+
+const agentDetectionCache = new Map<string, { expiresAt: number; agents: DetectedAgent[] }>();
+const agentDetectionInFlight = new Map<string, Promise<DetectedAgent[]>>();
+
+function stableJsonStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJsonStringify(v)}`).join(',')}}`;
+}
+
+export function clearAgentDetectionCache(): void {
+  agentDetectionCache.clear();
+  agentDetectionInFlight.clear();
+}
+
 type FetchedRuntimeModels = {
   models: RuntimeModelOption[];
   source: RuntimeModelSource;
@@ -360,4 +383,46 @@ export async function* detectAgentsStream(
     pending.delete(index);
     yield agent;
   }
+}
+
+export function detectAgentsCached(
+  configuredEnvByAgent: Record<string, Record<string, string>> = {},
+  options: {
+    detector?: AgentDetector;
+    now?: () => number;
+    ttlMs?: number;
+  } = {},
+): Promise<DetectedAgent[]> {
+  const detector = options.detector ?? detectAgents;
+  const now = options.now ?? Date.now;
+  const ttlMs = options.ttlMs ?? DEFAULT_AGENT_DETECTION_CACHE_TTL_MS;
+  const key = stableJsonStringify(configuredEnvByAgent ?? {});
+  const currentTime = now();
+  const cached = agentDetectionCache.get(key);
+  if (cached && cached.expiresAt > currentTime) {
+    return Promise.resolve(cached.agents);
+  }
+
+  const existing = agentDetectionInFlight.get(key);
+  if (existing) return existing;
+
+  const promise = detector(configuredEnvByAgent)
+    .then((agents) => {
+      if (ttlMs > 0) {
+        agentDetectionCache.set(key, {
+          agents,
+          expiresAt: now() + ttlMs,
+        });
+      } else {
+        agentDetectionCache.delete(key);
+      }
+      return agents;
+    })
+    .finally(() => {
+      if (agentDetectionInFlight.get(key) === promise) {
+        agentDetectionInFlight.delete(key);
+      }
+    });
+  agentDetectionInFlight.set(key, promise);
+  return promise;
 }

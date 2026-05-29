@@ -4,7 +4,12 @@ export {
   getAgentDef,
   readLocalAgentProfileDefs,
 } from './runtimes/registry.js';
-export { detectAgents, detectAgentsStream } from './runtimes/detection.js';
+export {
+  clearAgentDetectionCache,
+  detectAgents,
+  detectAgentsCached,
+  detectAgentsStream,
+} from './runtimes/detection.js';
 export {
   resolveOnPath,
   inspectAgentExecutableResolution,
