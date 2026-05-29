@@ -98,9 +98,11 @@ function deployProviderQuery(providerId?: WebDeployProviderId): string {
   return providerId ? `?providerId=${encodeURIComponent(providerId)}` : '';
 }
 
-export async function fetchAgents(options?: { throwOnError?: boolean }): Promise<AgentInfo[]> {
+export async function fetchAgents(options?: { throwOnError?: boolean; refresh?: boolean }): Promise<AgentInfo[]> {
   try {
-    const resp = await fetch('/api/agents', { cache: 'no-store' });
+    const resp = await fetch(options?.refresh ? '/api/agents?refresh=1' : '/api/agents', {
+      cache: 'no-store',
+    });
     if (!resp.ok) {
       if (options?.throwOnError) throw new Error(`agents ${resp.status}`);
       return [];
@@ -124,9 +126,12 @@ export async function fetchAgents(options?: { throwOnError?: boolean }): Promise
 export async function fetchAgentsStream(args: {
   onAgent: (agent: AgentInfo) => void;
   signal?: AbortSignal;
+  refresh?: boolean;
 }): Promise<AgentInfo[]> {
-  const { onAgent, signal } = args;
-  const resp = await fetch('/api/agents?stream=1', {
+  const { onAgent, signal, refresh } = args;
+  const query = new URLSearchParams({ stream: '1' });
+  if (refresh) query.set('refresh', '1');
+  const resp = await fetch(`/api/agents?${query.toString()}`, {
     cache: 'no-store',
     headers: { Accept: 'text/event-stream' },
     ...(signal ? { signal } : {}),

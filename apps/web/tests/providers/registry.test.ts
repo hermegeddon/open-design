@@ -67,6 +67,15 @@ describe('fetchAgentsStream', () => {
     expect(onAgent).toHaveBeenCalledWith(agent);
   });
 
+  it('passes refresh through to the streamed agents endpoint', async () => {
+    const fetchMock = vi.fn(async () => agentStreamResponse('event: done\ndata: {}\n\n'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchAgentsStream({ onAgent: vi.fn(), refresh: true })).resolves.toEqual([]);
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents?stream=1&refresh=1', expect.any(Object));
+  });
+
   it('throws when the stream emits an error event', async () => {
     vi.stubGlobal(
       'fetch',
