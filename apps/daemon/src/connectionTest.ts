@@ -2337,10 +2337,11 @@ async function testAgentConnectionInternal(
       const visibleText = buffered || parsedClaudeResultText;
       // ACP agents that don't shut down on stdin.end() are terminated after a
       // clean prompt completion. Depending on the ACP bridge, this can surface
-      // either as SIGTERM or as a normal code 130 teardown. For those exact
-      // forced-shutdown shapes we trust the ACP-level success signal so
-      // connection tests don't report `agent_spawn_failed` despite a healthy
-      // assistant response (see #1265 / #1286).
+      // as attachAcpSession's forced SIGTERM, Hermes ACP's teardown-only
+      // SIGABRT, or Vela's normal code 130 teardown. For those exact
+      // post-completion shutdown shapes we trust the ACP-level success signal
+      // so connection tests don't report `agent_spawn_failed` despite a
+      // healthy assistant response (see #1265 / #1286).
       //
       // Scope the override narrowly: only the known daemon-triggered ACP
       // teardown shapes plus `acpCleanCompletion` count as a clean forced
@@ -2351,10 +2352,12 @@ async function testAgentConnectionInternal(
       const acpCleanCompletion =
         typeof acpSession?.completedSuccessfully === 'function' &&
         acpSession.completedSuccessfully();
+      const acpCleanCompletionSignal =
+        winner.signal === 'SIGTERM' || winner.signal === 'SIGABRT';
       const acpForcedShutdown =
         acpCleanCompletion &&
         (
-          (winner.code === null && winner.signal === 'SIGTERM') ||
+          (winner.code === null && acpCleanCompletionSignal) ||
           (winner.code === 130 && winner.signal === null)
         );
       const claudeCompletedTurn =
