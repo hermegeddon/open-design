@@ -2457,6 +2457,12 @@ export interface Dict {
   'qf.cardSelected': string;
   'qf.cardRefs': string;
   'qf.cardSampleText': string;
+  'questions.tabLabel': string;
+  'questions.banner': string;
+  'questions.continue': string;
+  'questions.generating': string;
+  'questions.skipAll': string;
+  'questions.autoSkipHint': string;
 
   // Pet (Codex-style floating companion)
   'pet.title': string;
