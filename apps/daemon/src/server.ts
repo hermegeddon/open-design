@@ -4640,6 +4640,837 @@ export async function startServer({
     return Array.from(byTaskKind.values());
   }
 
+  app.post('/api/plugins/:id/apply', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const inputs = body.inputs && typeof body.inputs === 'object' ? body.inputs : {};
+      const grantCaps = Array.isArray(body.grantCaps)
+        ? body.grantCaps.filter((c) => typeof c === 'string')
+        : [];
+      const locale = typeof body.locale === 'string' ? body.locale : undefined;
+
+      const registry = await loadPluginRegistryView();
+      const connectorProbe = buildConnectorProbe(connectorService);
+      const computed = applyPlugin({ plugin, inputs, registry, locale, connectorProbe });
+      // Plan §3.B2 — apply-time grants are merged into the snapshot's
+      // capabilitiesGranted so the §9 capability gate sees them, but
+      // they are NOT written back to installed_plugins.capabilities_granted.
+      // The snapshot is the only place this ephemeral grant lives.
+      if (grantCaps.length > 0) {
+        const merged = new Set([...computed.result.capabilitiesGranted, ...grantCaps]);
+        computed.result.capabilitiesGranted = Array.from(merged);
+        computed.result.appliedPlugin.capabilitiesGranted = Array.from(merged);
+      }
+      res.json({ ok: true, ...computed.result, warnings: computed.warnings, manifestSourceDigest: computed.manifestSourceDigest });
+    } catch (err) {
+      if (err instanceof MissingInputError) {
+        return res.status(422).json({ error: 'missing_inputs', fields: err.fields });
+      }
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/plugins/:id/share-project', async (req, res) => {
+    try {
+      const sourcePlugin = getInstalledPlugin(db, req.params.id);
+      if (!sourcePlugin) {
+        sendApiError(res, 404, 'NOT_FOUND', 'plugin not found');
+        return;
+      }
+      if (!USER_PLUGIN_SOURCE_KINDS.has(sourcePlugin.sourceKind)) {
+        res.status(409).json({
+          ok: false,
+          code: 'plugin-not-shareable',
+          message: 'Only user-installed plugins can start a share project.',
+        });
+        return;
+      }
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const action = normalizePluginShareAction(body.action);
+      if (!action) {
+        sendApiError(res, 400, 'BAD_REQUEST', 'action must be publish-github or contribute-open-design');
+        return;
+      }
+      const actionPluginId = PLUGIN_SHARE_ACTION_PLUGIN_IDS[action];
+      const actionPlugin = getInstalledPlugin(db, actionPluginId);
+      if (!actionPlugin) {
+        res.status(409).json({
+          ok: false,
+          code: 'share-action-plugin-missing',
+          message: `The bundled action plugin "${actionPluginId}" is not installed. Restart the daemon so bundled plugins are registered.`,
+        });
+        return;
+      }
+
+      const now = Date.now();
+      const id = randomId();
+      const cid = randomId();
+      const sourceSlug = githubRepoNameFromPluginName(sourcePlugin.id);
+      const stagedPath = `plugin-source/${sourceSlug}`;
+      const prompt = renderPluginSharePrompt({ action, sourcePlugin, stagedPath });
+      const metadata = { kind: 'prototype' };
+      const projectRoot = await ensureProject(PROJECTS_DIR, id, metadata);
+      await copyPluginFolderForProjectContext(
+        sourcePlugin.fsPath,
+        path.join(projectRoot, 'plugin-source', sourceSlug),
+      );
+
+      insertProject(db, {
+        id,
+        name: `${PLUGIN_SHARE_ACTION_LABELS[action]}: ${sourcePlugin.title || sourcePlugin.id}`,
+        skillId: null,
+        designSystemId: null,
+        pendingPrompt: prompt,
+        metadata,
+        createdAt: now,
+        updatedAt: now,
+      });
+      insertConversation(db, {
+        id: cid,
+        projectId: id,
+        title: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const registry = await loadPluginRegistryView();
+      const connectorProbe = buildConnectorProbe(connectorService);
+      const resolved = resolvePluginSnapshot({
+        db,
+        body: {
+          pluginId: actionPluginId,
+          pluginInputs: {
+            source_plugin_id: sourcePlugin.id,
+            source_plugin_title: sourcePlugin.title || sourcePlugin.id,
+            source_plugin_version: sourcePlugin.version,
+            source_plugin_path: sourcePlugin.fsPath,
+            plugin_context_path: stagedPath,
+          },
+          locale: typeof body.locale === 'string' ? body.locale : undefined,
+        },
+        projectId: id,
+        conversationId: cid,
+        registry,
+        connectorProbe,
+      });
+      if (resolved && !resolved.ok) {
+        res.status(resolved.status).json(resolved.body);
+        return;
+      }
+
+      const project = getProject(db, id);
+      if (!project) {
+        sendApiError(res, 500, 'INTERNAL_ERROR', 'created project could not be loaded');
+        return;
+      }
+      res.json({
+        ok: true,
+        project,
+        conversationId: cid,
+        ...(resolved?.ok ? { appliedPluginSnapshotId: resolved.snapshotId } : {}),
+        actionPluginId,
+        sourcePluginId: sourcePlugin.id,
+        stagedPath,
+        prompt,
+        message: `Created a ${PLUGIN_SHARE_ACTION_LABELS[action]} task for ${sourcePlugin.title || sourcePlugin.id}.`,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, message: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/plugins/:id/doctor', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const registry = await loadPluginRegistryView();
+      const connectorProbe = buildConnectorProbe(connectorService);
+      const report = doctorPlugin(plugin, registry, { connectorProbe });
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.A2 / spec §9.1: persistent capability grant. Body is
+  // `{ capabilities: string[], action?: 'grant' | 'revoke' }`. The daemon
+  // validates each entry against the §5.3 vocabulary; unknown / malformed
+  // strings come back as 400 with the offending list so the CLI can
+  // render exit-code-2 usage advice. The mutation goes through
+  // `grantCapabilities` / `revokeCapabilities` (the only writers of
+  // `installed_plugins.capabilities_granted` outside of install).
+  app.post('/api/plugins/:id/trust', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const action = body.action === 'revoke' ? 'revoke' : 'grant';
+      const { validateCapabilityList, grantCapabilities, revokeCapabilities } =
+        await import('./plugins/trust.js');
+      const { accepted, rejected } = validateCapabilityList(body.capabilities);
+      if (rejected.length > 0) {
+        return res.status(400).json({
+          error: {
+            code: 'invalid-capability',
+            message: `Capability validation failed: ${rejected.map((r) => r.capability).join(', ')}`,
+            data: { rejected },
+          },
+        });
+      }
+      if (accepted.length === 0) {
+        return res.status(400).json({
+          error: {
+            code: 'no-capabilities',
+            message: 'capabilities[] is required and must contain at least one entry',
+          },
+        });
+      }
+      const next = action === 'revoke'
+        ? revokeCapabilities({ db, pluginId: req.params.id, capabilities: accepted })
+        : grantCapabilities({ db, pluginId: req.params.id, capabilities: accepted });
+      const updated = getInstalledPlugin(db, req.params.id);
+      // Plan §3.JJ1 — emit a 'plugin.trust-changed' event so the
+      // ops live-tail surfaces capability mutations for security
+      // audit. Best-effort.
+      try {
+        const { recordPluginEvent } = await import('./plugins/events.js');
+        recordPluginEvent({
+          kind:     'plugin.trust-changed',
+          pluginId: req.params.id,
+          details:  { action, capabilities: accepted, total: next.length },
+        });
+      } catch {
+        // ignore — event recording never blocks the trust mutation.
+      }
+      res.status(action === 'grant' ? 201 : 200).json({
+        ok: true,
+        id: req.params.id,
+        action,
+        capabilitiesGranted: next,
+        plugin: updated,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/atoms', (_req, res) => {
+    res.json({ atoms: FIRST_PARTY_ATOMS.map((a) => ({ ...a, taskKinds: a.taskKinds.slice() })) });
+  });
+
+  // Plan §3.AA2 — `od atoms info <id>`. Returns the catalog row +
+  // the bundled SKILL.md body (when one exists at
+  // plugins/_official/atoms/<id>/SKILL.md) so the caller can render
+  // a single page describing what the atom does + the prompt
+  // fragment that drives it.
+  app.get('/api/atoms/:id', async (req, res) => {
+    const id = req.params.id;
+    const atom = FIRST_PARTY_ATOMS.find((a) => a.id === id);
+    if (!atom) return res.status(404).json({ error: { code: 'atom-not-found', message: `Unknown atom "${id}"` } });
+    const body: Record<string, unknown> = {
+      ...atom,
+      taskKinds: atom.taskKinds.slice(),
+    };
+    try {
+      const { loadAtomBodies } = await import('./plugins/atom-bodies.js');
+      const bodies = await loadAtomBodies(db, [id]);
+      if (bodies[0] && typeof bodies[0].body === 'string') {
+        body.skillBody = bodies[0].body;
+      }
+    } catch (err) {
+      // Best-effort; atom info still useful without the body.
+      console.warn(`[atoms] failed to load SKILL.md body for ${id}:`, err);
+    }
+    res.json(body);
+  });
+
+  // Plan §3.L3 / spec §10.3.5 / §9.2 — plugin asset endpoint.
+  //
+  // Serves a static file from inside an installed plugin's fsPath,
+  // sandboxed by:
+  //   - whitelisted plugin ids (the registry row),
+  //   - normalized relpath (no '..' / absolute / leading drive),
+  //   - the §9.2 preview CSP (default-src 'none'; script-src 'self'
+  //     'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'),
+  //   - X-Content-Type-Options: nosniff so the browser respects the
+  //     declared content type even on miss.
+  // The web GenUISurfaceRenderer's SandboxedComponentSurface points
+  // its iframe at this URL.
+  // Helper for the /preview + /example/:name routes below. Walks a
+  // list of candidate relpaths inside the plugin folder, picks the
+  // first one that exists + stays inside the fsPath, and serves it
+  // with the §9.2 sandboxed-iframe CSP (same shape as `/asset/*`).
+  // Pulled out so /preview and /example/:name share a single source
+  // of truth for the security envelope.
+  async function servePluginSandboxedHtml(
+    req: any,
+    res: any,
+    pickCandidates: (plugin: any) => Promise<string[]> | string[],
+  ): Promise<void> {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) {
+        res.status(404).json({ error: 'plugin not found' });
+        return;
+      }
+      const candidates = (await pickCandidates(plugin)).filter(
+        (p): p is string => typeof p === 'string' && p.length > 0,
+      );
+      const path = await import('node:path');
+      const fsp = await import('node:fs/promises');
+      const root = path.resolve(plugin.fsPath) + path.sep;
+      let resolved: string | null = null;
+      let resolvedRel: string | null = null;
+      for (const rel of candidates) {
+        if (rel.includes('..') || rel.startsWith('/') || rel.includes('\0')) continue;
+        const full = path.resolve(plugin.fsPath, rel);
+        if (!(full + path.sep).startsWith(root) && full !== path.resolve(plugin.fsPath)) continue;
+        try {
+          const st = await fsp.stat(full);
+          // Refuse symlinks — the install root may be writable so a
+          // symlink leak would defeat the containment check above.
+          const lst = await fsp.lstat(full);
+          if (lst.isSymbolicLink()) continue;
+          if (!st.isFile()) continue;
+          // 5 MiB cap — preview HTML is human-authored; refuse anything
+          // resembling a binary blob smuggled through this surface.
+          if (st.size > 5 * 1024 * 1024) {
+            res.status(413).json({ error: 'preview asset too large' });
+            return;
+          }
+          resolved = full;
+          resolvedRel = rel;
+          break;
+        } catch {
+          // try next candidate
+        }
+      }
+      if (!resolved) {
+        res.status(404).json({ error: 'preview not found' });
+        return;
+      }
+      let contentPath = resolved;
+      let contentRel = resolvedRel;
+      let buf = await fsp.readFile(resolved);
+      if (resolvedRel && /\.html?$/i.test(resolvedRel)) {
+        const shellTarget = iframeOnlyHtmlShellTarget(buf.toString('utf8'));
+        if (shellTarget) {
+          const targetFull = path.resolve(path.dirname(resolved), shellTarget);
+          const rootDir = path.resolve(plugin.fsPath);
+          const insideRoot =
+            (targetFull + path.sep).startsWith(root) ||
+            targetFull === rootDir;
+          if (insideRoot) {
+            try {
+              const st = await fsp.stat(targetFull);
+              const lst = await fsp.lstat(targetFull);
+              if (!lst.isSymbolicLink() && st.isFile() && st.size <= 5 * 1024 * 1024) {
+                buf = await fsp.readFile(targetFull);
+                contentPath = targetFull;
+                contentRel = path.relative(plugin.fsPath, targetFull).split(path.sep).join('/');
+              }
+            } catch {
+              // Keep the wrapper HTML if the iframe target cannot be read.
+            }
+          }
+        }
+      }
+      if (resolvedRel && /(^|\/)example-slides\.html$/i.test(resolvedRel)) {
+        const templateRel = resolvedRel.replace(
+          /(^|\/)example-slides\.html$/i,
+          '$1template.html',
+        );
+        const templateFull = path.resolve(plugin.fsPath, templateRel);
+        const templateInside =
+          (templateFull + path.sep).startsWith(root) ||
+          templateFull === path.resolve(plugin.fsPath);
+        if (templateInside) {
+          try {
+            const st = await fsp.stat(templateFull);
+            const lst = await fsp.lstat(templateFull);
+            if (!lst.isSymbolicLink() && st.isFile() && st.size <= 5 * 1024 * 1024) {
+              const title =
+                typeof plugin.title === 'string'
+                  ? plugin.title
+                  : typeof plugin.manifest?.title === 'string'
+                    ? plugin.manifest.title
+                    : req.params.id;
+              const tplHtml = await fsp.readFile(templateFull, 'utf8');
+              const slidesHtml = buf.toString('utf8');
+              buf = Buffer.from(assembleExample(tplHtml, slidesHtml, title), 'utf8');
+              contentPath = templateFull;
+              contentRel = templateRel;
+            }
+          } catch {
+            // Keep the raw fallback if the companion template is missing.
+          }
+        }
+      }
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'",
+      );
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      const ext = path.extname(contentPath).toLowerCase();
+      const ct =
+        ext === '.html' ? 'text/html; charset=utf-8'
+        : ext === '.js'  ? 'application/javascript; charset=utf-8'
+        : ext === '.css' ? 'text/css; charset=utf-8'
+        : ext === '.json' ? 'application/json; charset=utf-8'
+        : ext === '.svg' ? 'image/svg+xml'
+        : ext === '.png' ? 'image/png'
+        : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+        : 'application/octet-stream';
+      res.setHeader('Content-Type', ct);
+      if (ext === '.html' && typeof contentRel === 'string') {
+        const rewritten = rewritePluginAssetUrls(
+          buf.toString('utf8'),
+          req.params.id,
+          path.posix.dirname(contentRel.replace(/\\/g, '/')),
+        );
+        buf = Buffer.from(sanitizePluginPreviewHtml(rewritten), 'utf8');
+      }
+      res.send(buf);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  }
+
+  function iframeOnlyHtmlShellTarget(html: string): string | null {
+    if (typeof html !== 'string' || html.length === 0) return null;
+    const bodyMatch = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(html);
+    if (!bodyMatch) return null;
+    const body = bodyMatch[1].replace(/<!--[\s\S]*?-->/g, '').trim();
+    const iframeMatch = /^<iframe\b[^>]*\bsrc\s*=\s*(['"])([^'"]+)\1[^>]*>\s*(?:<\/iframe>)?\s*$/i.exec(body);
+    if (!iframeMatch) return null;
+    const src = iframeMatch[2].trim();
+    if (
+      !src ||
+      src.startsWith('/') ||
+      src.startsWith('//') ||
+      src.includes('\0') ||
+      /^[a-z][a-z0-9+.-]*:/i.test(src)
+    ) {
+      return null;
+    }
+    const pathOnly = src.split(/[?#]/)[0] ?? '';
+    if (!/\.html?$/i.test(pathOnly)) return null;
+    return pathOnly;
+  }
+
+  function rewritePluginAssetUrls(html: string, pluginId: string, baseDir: string) {
+    if (typeof html !== 'string' || html.length === 0) return html;
+    const safeBase = baseDir === '.' ? '' : baseDir;
+    const withAttrs = html.replace(
+      /(\s(?:src|href|poster)\s*=\s*)(['"])([^'"]+)(\2)/gi,
+      (match, attr, quote, rawValue, closeQuote) => {
+        const value = String(rawValue).trim();
+        // External media (cross-border CDN images/videos) is blocked by the
+        // sandbox CSP and is slow; route src/poster through the same-origin
+        // asset cache. href stays untouched (anchors + external stylesheets).
+        if (
+          /^https?:\/\//i.test(value) &&
+          !/\bhref\b/i.test(String(attr)) &&
+          isCacheableExternalUrl(value)
+        ) {
+          return `${attr}${quote}${assetCacheRewriteUrl(value)}${closeQuote}`;
+        }
+        if (
+          !value ||
+          value.startsWith('#') ||
+          value.startsWith('/') ||
+          value.startsWith('//') ||
+          value.includes('\0') ||
+          /^[a-z][a-z0-9+.-]*:/i.test(value)
+        ) {
+          return match;
+        }
+        const splitAt = value.search(/[?#]/);
+        const rel = splitAt === -1 ? value : value.slice(0, splitAt);
+        const suffix = splitAt === -1 ? '' : value.slice(splitAt);
+        const normalized = path.posix.normalize(path.posix.join(safeBase, rel));
+        if (
+          normalized === '.' ||
+          normalized === '..' ||
+          normalized.startsWith('../') ||
+          path.posix.isAbsolute(normalized)
+        ) {
+          return match;
+        }
+        const url = `/api/plugins/${encodeURIComponent(pluginId)}/asset/${normalized}${suffix}`;
+        return `${attr}${quote}${url}${closeQuote}`;
+      },
+    );
+    // Preview seeds also pull external media outside src/poster: CSS
+    // `background-image: url(...)`, and — most commonly in these templates —
+    // JS string constants like `const HERO = 'https://cdn/.../bg.png'` that get
+    // assigned to `style.backgroundImage` at runtime. Rewrite any quoted
+    // absolute media URL (covers JS literals + quoted CSS url() + quoted attrs)
+    // and any unquoted `url(...)`. Gating on a media extension keeps this from
+    // touching scripts, stylesheets, or fonts. URLs already rewritten by the
+    // attribute pass are percent-encoded inside `?url=` and no longer match.
+    const withQuoted = withAttrs.replace(
+      /(['"])(https?:\/\/[^'"]+)\1/g,
+      (match, quote, rawValue) => {
+        const value = String(rawValue).trim();
+        if (!isCacheableExternalUrl(value)) return match;
+        return `${quote}${assetCacheRewriteUrl(value)}${quote}`;
+      },
+    );
+    return withQuoted.replace(
+      /url\(\s*(https?:\/\/[^)'"\s]+)\s*\)/gi,
+      (match, rawValue) => {
+        const value = String(rawValue).trim();
+        if (!isCacheableExternalUrl(value)) return match;
+        return `url(${assetCacheRewriteUrl(value)})`;
+      },
+    );
+  }
+
+  const PREVIEW_NETWORK_DISABLED_SCRIPT = `<script>(function(){var ResponseCtor=window.Response;window.fetch=function(){try{if(ResponseCtor){return Promise.resolve(new ResponseCtor(null,{status:403,statusText:'Open Design preview network disabled'}));}}catch(_err){}return Promise.resolve({ok:false,status:403,statusText:'Open Design preview network disabled',json:function(){return Promise.resolve(null);},text:function(){return Promise.resolve('');}});};})();</script>`;
+
+  function sanitizePluginPreviewHtml(html: string) {
+    if (typeof html !== 'string' || html.length === 0) return html;
+    let next = html
+      // The preview CSP intentionally disallows third-party styles, scripts,
+      // and network calls. Remove already-blocked remote style/script tags so
+      // official gallery previews don't flood DevTools with CSP issues while
+      // retaining the same fail-closed sandbox policy.
+      .replace(/<link\b[^>]*\bhref\s*=\s*(['"])https?:\/\/[^'"]+\1[^>]*>/gi, (tag) => {
+        const lower = String(tag).toLowerCase();
+        if (/\brel\s*=\s*(['"])[^'"]*(stylesheet|preconnect|dns-prefetch|preload)[^'"]*\1/.test(lower)) {
+          return '';
+        }
+        if (/\bas\s*=\s*(['"])style\1/.test(lower)) return '';
+        return tag;
+      })
+      .replace(/@import\s+(?:url\()?['"]?https?:\/\/[^'")]+['"]?\)?\s*;/gi, '')
+      .replace(/<script\b[^>]*\bsrc\s*=\s*(['"])https?:\/\/[^'"]+\1[^>]*>\s*<\/script>/gi, '');
+
+    if (/<\/head\s*>/i.test(next)) {
+      return next.replace(/<\/head\s*>/i, `${PREVIEW_NETWORK_DISABLED_SCRIPT}</head>`);
+    }
+    return `${PREVIEW_NETWORK_DISABLED_SCRIPT}${next}`;
+  }
+
+  // Plan §6 Phase 2B + spec §11.6 / §9.2 — plugin preview + examples.
+  //
+  // Two flavours wrap the same sandboxed-HTML envelope as `/asset/*`:
+  //   - `/preview` serves the plugin's preview entry (declared via
+  //     `od.preview.entry`, with fallbacks that walk the plugin's
+  //     own context.assets[] HTMLs, examples/*.html and assets/*.html).
+  //   - `/example/:name` serves an entry from `od.useCase.exampleOutputs[]`,
+  //     matched by basename or by index. Both reuse the same
+  //     traversal / containment guards as the asset route.
+  //
+  // The marketplace detail page (PluginDetailView) embeds /preview
+  // inside an `<iframe sandbox="allow-scripts">`. The §9.2 CSP keeps
+  // the preview from reaching back into /api/* even if its scripts
+  // try to fetch.
+  //
+  // Some bundled plugins (`example-guizang-ppt`, `example-html-ppt`,
+  // …) declare `od.preview.entry: "./index.html"` but actually ship
+  // the renderable HTML under `assets/example-slides.html` or
+  // `assets/template.html`. Returning 404 in that case lit up white
+  // tiles in the home gallery, so the candidates list always extends
+  // past the declared entry to walk a curated fallback chain.
+  //
+  // `assets/example-slides.html` is a special case: for guizang-ppt it
+  // is intentionally only the slide fragment. The old skill preview
+  // assembled it into `assets/template.html` at request time; the plugin
+  // route mirrors that so the marketplace card keeps the WebGL/e-ink
+  // magazine treatment instead of rendering unstyled fragments.
+  function collectPluginPreviewCandidates(plugin: unknown): string[] {
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    function push(rel: unknown): void {
+      if (typeof rel !== 'string') return;
+      const trimmed = rel.replace(/^\.\//, '');
+      if (!trimmed || seen.has(trimmed)) return;
+      seen.add(trimmed);
+      candidates.push(trimmed);
+    }
+
+    const manifest =
+      ((plugin as { manifest?: unknown }).manifest ?? {}) as Record<string, unknown>;
+    const od = (manifest.od ?? {}) as Record<string, unknown>;
+    const preview = (od.preview ?? {}) as Record<string, unknown>;
+
+    push(preview.entry);
+
+    const ctx = (od.context ?? {}) as Record<string, unknown>;
+    const assets = Array.isArray(ctx.assets) ? ctx.assets : [];
+    for (const a of assets) {
+      const rel = typeof a === 'string' ? a : null;
+      if (rel && /\.html?$/i.test(rel)) push(rel);
+    }
+
+    const useCase = (od.useCase ?? {}) as Record<string, unknown>;
+    const exampleOutputs = Array.isArray(useCase.exampleOutputs)
+      ? useCase.exampleOutputs
+      : [];
+    for (const ex of exampleOutputs) {
+      const p = (ex as { path?: unknown })?.path;
+      if (typeof p === 'string' && /\.html?$/i.test(p)) push(p);
+    }
+
+    push('preview/index.html');
+    push('index.html');
+    push('examples/index.html');
+    push('assets/index.html');
+    push('assets/preview.html');
+    push('assets/example.html');
+    push('assets/example-slides.html');
+    push('assets/template.html');
+    push('public/index.html');
+    push('dist/index.html');
+    return candidates;
+  }
+
+  // Last-resort discovery for plugins whose bundle ships HTML but
+  // doesn't match any of the conventional paths. We scan the plugin
+  // root and a handful of common subfolders (assets/, public/, dist/,
+  // examples/, preview/, templates/) for any `*.html` and surface
+  // the first one. The scan is shallow to avoid pathological large
+  // bundles, and the same containment guard inside
+  // servePluginSandboxedHtml validates each candidate before reading.
+  async function discoverPluginHtmlAssets(pluginFsPath: string): Promise<string[]> {
+    const path = await import('node:path');
+    const fsp = await import('node:fs/promises');
+    const dirs = ['', 'assets', 'public', 'dist', 'examples', 'preview', 'templates'];
+    const found: string[] = [];
+    for (const dir of dirs) {
+      const abs = path.resolve(pluginFsPath, dir);
+      try {
+        const entries = await fsp.readdir(abs, { withFileTypes: true });
+        for (const ent of entries) {
+          if (!ent.isFile()) continue;
+          if (!/\.html?$/i.test(ent.name)) continue;
+          found.push(dir ? `${dir}/${ent.name}` : ent.name);
+        }
+      } catch {
+        // dir missing — skip
+      }
+    }
+    return found;
+  }
+
+  app.get('/api/plugins/:id/preview', async (req, res) => {
+    await servePluginSandboxedHtml(req, res, async (plugin) => {
+      const curated = collectPluginPreviewCandidates(plugin);
+      const fsPath = (plugin as { fsPath?: unknown }).fsPath;
+      if (typeof fsPath !== 'string') return curated;
+      const discovered = await discoverPluginHtmlAssets(fsPath);
+      const seen = new Set(curated);
+      for (const rel of discovered) {
+        if (!seen.has(rel)) curated.push(rel);
+      }
+      return curated;
+    });
+  });
+
+  app.get('/api/plugins/:id/example/:name', async (req, res) => {
+    const name = String(req.params.name ?? '');
+    if (!name || /[\\/\0]|\.\./.test(name)) {
+      return res.status(400).json({ error: 'invalid example name' });
+    }
+    await servePluginSandboxedHtml(req, res, async (plugin) => {
+      const examples = ((plugin as { manifest?: { od?: { useCase?: { exampleOutputs?: Array<{ path?: unknown; title?: unknown }> } } } })
+        .manifest?.od?.useCase?.exampleOutputs ?? []) as Array<{ path?: unknown; title?: unknown }>;
+      const match = examples.find((e) => {
+        if (!e || typeof e.path !== 'string') return false;
+        const segments = e.path.split(/[\\/]/).filter(Boolean);
+        const base = segments[segments.length - 1] ?? '';
+        const baseStem = base.replace(/\.[^.]+$/, '');
+        // For `examples/<folder>/index.html` the conceptual "name"
+        // is the folder, not the inner basename.
+        const parent = segments.length >= 2 ? segments[segments.length - 2] : null;
+        const candidates = [base, baseStem, parent].filter((s): s is string => !!s);
+        if (typeof e.title === 'string') candidates.push(e.title);
+        return candidates.includes(name);
+      });
+      if (match && typeof match.path === 'string') return [match.path];
+      // Allow `examples/<name>/index.html` and `examples/<name>.html`
+      // so plugin authors can ship example folders without enumerating
+      // them in the manifest.
+      return [
+        `examples/${name}/index.html`,
+        `examples/${name}.html`,
+      ];
+    });
+  });
+
+  app.get('/api/plugins/:id/asset/*splat', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const splatParam = req.params.splat;
+      const relpath = Array.isArray(splatParam) ? splatParam.join('/') : String(splatParam ?? '');
+      // Reject obvious traversal up-front; the path resolution below
+      // normalizes again, but this catches the easy cases without
+      // touching disk.
+      if (!relpath || relpath.includes('..') || relpath.startsWith('/') || relpath.includes('\0')) {
+        return res.status(400).json({ error: 'invalid asset path' });
+      }
+      const path = await import('node:path');
+      const fsp = await import('node:fs/promises');
+      const resolved = path.resolve(plugin.fsPath, relpath);
+      // Final containment check — `resolved` must stay under fsPath.
+      const root = path.resolve(plugin.fsPath);
+      const rootWithSep = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+      if (!(resolved + path.sep).startsWith(rootWithSep) && resolved !== root) {
+        return res.status(400).json({ error: 'asset escape rejected' });
+      }
+      const relativeSegments = path.relative(root, resolved).split(path.sep).filter(Boolean);
+      let current = root;
+      try {
+        const rootStat = await fsp.lstat(current);
+        if (rootStat.isSymbolicLink()) {
+          return res.status(404).json({ error: 'asset not found' });
+        }
+        for (const segment of relativeSegments) {
+          current = path.join(current, segment);
+          const stat = await fsp.lstat(current);
+          if (stat.isSymbolicLink()) {
+            return res.status(404).json({ error: 'asset not found' });
+          }
+        }
+      } catch {
+        return res.status(404).json({ error: 'asset not found' });
+      }
+      try {
+        const rootReal = await fsp.realpath(plugin.fsPath);
+        const resolvedReal = await fsp.realpath(resolved);
+        const rootRealWithSep = rootReal.endsWith(path.sep) ? rootReal : `${rootReal}${path.sep}`;
+        if (resolvedReal !== rootReal && !resolvedReal.startsWith(rootRealWithSep)) {
+          return res.status(400).json({ error: 'asset escape rejected' });
+        }
+      } catch {
+        return res.status(404).json({ error: 'asset not found' });
+      }
+      let buf;
+      try {
+        buf = await fsp.readFile(resolved);
+      } catch {
+        return res.status(404).json({ error: 'asset not found' });
+      }
+      // §9.2 preview CSP — sandboxed iframes get only inline script + style;
+      // no network, no external resources, no document-level forms.
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'",
+      );
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      const ext = path.extname(resolved).toLowerCase();
+      const ct =
+        ext === '.html' ? 'text/html; charset=utf-8'
+        : ext === '.js'  ? 'application/javascript; charset=utf-8'
+        : ext === '.css' ? 'text/css; charset=utf-8'
+        : ext === '.json' ? 'application/json; charset=utf-8'
+        : ext === '.svg' ? 'image/svg+xml'
+        : ext === '.png' ? 'image/png'
+        : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+        : 'application/octet-stream';
+      res.setHeader('Content-Type', ct);
+      res.send(buf);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Same-origin proxy + disk cache for the external media that plugin preview
+  // HTML references on cross-border CDNs. `rewritePluginAssetUrls` rewrites
+  // those URLs to this route so they satisfy the sandbox CSP (`img-src 'self'`)
+  // and load from local cache instead of re-paying cross-border latency.
+  // SSRF guards live in plugin-asset-cache.ts (scheme + private-address checks).
+  app.get('/api/asset-cache', async (req, res) => {
+    const rawUrl =
+      typeof req.query.url === 'string'
+        ? req.query.url
+        : Array.isArray(req.query.url) && typeof req.query.url[0] === 'string'
+          ? req.query.url[0]
+          : '';
+    if (!rawUrl) {
+      return res.status(400).json({ error: 'missing url query parameter' });
+    }
+    try {
+      const { buf, contentType } = await pluginAssetCache.get(rawUrl);
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'");
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      return res.send(buf);
+    } catch (err) {
+      const status = err instanceof AssetCacheError ? err.status : 502;
+      return res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Plan §3.H2 / spec §12.2 — craft list endpoint.
+  // Mirrors the daemon's existing /api/skills + /api/design-systems
+  // discovery surface so `od craft list` is a thin wrapper over a
+  // single HTTP call. Each entry returns a slug + size + first
+  // markdown header so a code agent can browse without a separate
+  // /api/craft/:id read.
+  app.get('/api/craft', async (_req, res) => {
+    try {
+      const fsp = await import('node:fs/promises');
+      let entries;
+      try {
+        entries = await fsp.readdir(CRAFT_DIR, { withFileTypes: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return res.json({ craft: [] });
+        }
+        throw err;
+      }
+      const out = [];
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+        const slug = entry.name.replace(/\.md$/, '');
+        try {
+          const fullPath = `${CRAFT_DIR}/${entry.name}`;
+          const text = await fsp.readFile(fullPath, 'utf8');
+          const heading = text.split('\n').find((line) => line.startsWith('# '));
+          out.push({
+            id:     slug,
+            label:  heading ? heading.replace(/^#+\s*/, '').trim() : slug,
+            bytes:  Buffer.byteLength(text, 'utf8'),
+          });
+        } catch {
+          // Skip unreadable files; surface what we can.
+        }
+      }
+      res.json({ craft: out });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/craft/:id', async (req, res) => {
+    try {
+      const slug = req.params.id;
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+        return res.status(400).json({ error: 'invalid craft id' });
+      }
+      const fsp = await import('node:fs/promises');
+      try {
+        const text = await fsp.readFile(`${CRAFT_DIR}/${slug}.md`, 'utf8');
+        res.json({ id: slug, body: text });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return res.status(404).json({ error: 'craft section not found' });
+        }
+        throw err;
+      }
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   registerPluginRoutes(app, {
     db,
     paths: { PROJECTS_DIR, PLUGIN_REGISTRY_ROOTS, PLUGIN_LOCKFILE_PATH },

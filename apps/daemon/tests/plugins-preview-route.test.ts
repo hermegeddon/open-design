@@ -42,7 +42,16 @@ beforeEach(async () => {
   await mkdir(path.join(folder, 'examples', 'wrapped'), { recursive: true });
   await writeFile(
     path.join(folder, 'preview', 'index.html'),
-    '<!DOCTYPE html><title>preview</title><p>preview body</p>',
+    [
+      '<!DOCTYPE html><head>',
+      '<link rel="preconnect" href="https://fonts.gstatic.com">',
+      '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">',
+      '<style>@import url("https://fonts.googleapis.com/css2?family=Inter");</style>',
+      '<script src="https://cdn.tailwindcss.com"></script>',
+      '</head><body><p>preview body</p>',
+      '<script>fetch("https://api.github.com/repos/nexu-io/open-design")</script>',
+      '</body>',
+    ].join(''),
   );
   await writeFile(
     path.join(folder, 'examples', 'desk-warm', 'index.html'),
@@ -148,6 +157,10 @@ describe('GET /api/plugins/:id/preview', () => {
     expect(resp.headers.get('x-content-type-options')).toBe('nosniff');
     const body = await resp.text();
     expect(body).toContain('preview body');
+    expect(body).toContain('Open Design preview network disabled');
+    expect(body).not.toContain('https://fonts.googleapis.com');
+    expect(body).not.toContain('https://fonts.gstatic.com');
+    expect(body).not.toContain('https://cdn.tailwindcss.com');
   });
 
   it('returns 404 when the plugin id is unknown', async () => {

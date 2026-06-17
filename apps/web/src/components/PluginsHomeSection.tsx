@@ -490,6 +490,8 @@ function SearchInput({ value, onChange }: SearchInputProps) {
     <div className="plugins-home__search">
       <Icon name="search" size={12} className="plugins-home__search-icon" />
       <Input
+        id="plugins-home-search"
+        name="plugins-home-search"
         type="search"
         className="plugins-home__search-input"
         value={value}
