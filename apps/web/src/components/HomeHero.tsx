@@ -1691,6 +1691,8 @@ export const HomeHero = forwardRef<HomeHeroHandle, Props>(function HomeHero(
         <div className="home-hero__input-foot">
           <input
             ref={fileInputRef}
+            id="home-hero-file-input"
+            name="home-hero-files"
             data-testid="home-hero-file-input"
             type="file"
             multiple
