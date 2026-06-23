@@ -52,10 +52,18 @@ export function classifyChatRunCloseStatus(params: {
 }): 'canceled' | 'succeeded' | 'failed' {
   if (params.cancelRequested) return 'canceled';
   if (params.code === 0) return 'succeeded';
+  const acpCleanCompletionSignal =
+    params.signal === 'SIGTERM' ||
+    // Hermes ACP can currently abort during interpreter teardown after it
+    // has already returned the session/prompt result. Once the ACP layer has
+    // observed a clean prompt completion, treat that teardown-only SIGABRT the
+    // same way as attachAcpSession's forced SIGTERM so the UI preserves the
+    // completed assistant response instead of rewriting it as a failed run.
+    params.signal === 'SIGABRT';
   const acpForcedShutdown =
     params.acpCleanCompletion &&
     (
-      (params.code === null && params.signal === 'SIGTERM') ||
+      (params.code === null && acpCleanCompletionSignal) ||
       (params.code === 130 && params.signal === null)
     );
   if (acpForcedShutdown) return 'succeeded';
